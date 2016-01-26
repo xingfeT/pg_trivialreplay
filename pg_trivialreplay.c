@@ -1,12 +1,12 @@
 /*-------------------------------------------------------------------------
  *
- * pg_recvlogical.c - receive data from a logical decoding slot in a streaming
- *					  fashion and write it to a local file.
+ * pg_trivialreplay.c - trivial logical replication replayer. Mostly based on
+ *                      forking pg_recvlogical.
+ *
+ * assumes decoder_raw from https://github.com/michaelpq/pg_plugins/tree/master/decoder_raw
  *
  * Portions Copyright (c) 1996-2016, PostgreSQL Global Development Group
  *
- * IDENTIFICATION
- *		  src/bin/pg_basebackup/pg_recvlogical.c
  *-------------------------------------------------------------------------
  */
 
@@ -14,6 +14,8 @@
 
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <netinet/in.h>
 #include <unistd.h>
 
 /* local includes */
@@ -31,7 +33,6 @@
 #define RECONNECT_SLEEP_TIME 5
 
 /* Global Options */
-static char *outfile = NULL;
 static int	verbose = 0;
 static int	noloop = 0;
 static int	standby_message_timeout = 10 * 1000;		/* 10 sec = default */
@@ -41,19 +42,16 @@ static bool do_create_slot = false;
 static bool slot_exists_ok = false;
 static bool do_start_slot = false;
 static bool do_drop_slot = false;
+static char *log_dsn = NULL;
+static char *target_dsn = NULL;
 
 /* filled pairwise with option, value. value may be NULL */
 static char **options;
 static size_t noptions = 0;
-static const char *plugin = "test_decoding";
+static const char *plugin = "decoder_raw";
 
 /* Global State */
-static int	outfd = -1;
 static volatile sig_atomic_t time_to_abort = false;
-static volatile sig_atomic_t output_reopen = false;
-static bool output_isfile;
-static int64 output_last_fsync = -1;
-static bool output_needs_fsync = false;
 static XLogRecPtr output_written_lsn = InvalidXLogRecPtr;
 static XLogRecPtr output_fsync_lsn = InvalidXLogRecPtr;
 
@@ -64,7 +62,7 @@ static void disconnect_and_exit(int code);
 static void
 usage(void)
 {
-	printf(_("%s controls PostgreSQL logical decoding streams.\n\n"),
+	printf(_("%s receives and replays PostgreSQL logical decoding stream.\n\n"),
 		   progname);
 	printf(_("Usage:\n"));
 	printf(_("  %s [OPTION]...\n"), progname);
@@ -73,11 +71,9 @@ usage(void)
 	printf(_("      --drop-slot        drop the replication slot (for the slot's name see --slot)\n"));
 	printf(_("      --start            start streaming in a replication slot (for the slot's name see --slot)\n"));
 	printf(_("\nOptions:\n"));
-	printf(_("  -f, --file=FILE        receive log into this file, - for stdout\n"));
-	printf(_("  -F  --fsync-interval=SECS\n"
-			 "                         time between fsyncs to the output file (default: %d)\n"), (fsync_interval / 1000));
 	printf(_("      --if-not-exists    do not error if slot already exists when creating a slot\n"));
 	printf(_("  -I, --startpos=LSN     where in an existing slot should the streaming start\n"));
+	printf(_("  -l, --logserver=DSN    DSN to database to connect and write logs to\n"));
 	printf(_("  -n, --no-loop          do not loop on connection lost\n"));
 	printf(_("  -o, --option=NAME[=VALUE]\n"
 			 "                         pass option NAME with optional value VALUE to the\n"
@@ -86,6 +82,7 @@ usage(void)
 	printf(_("  -s, --status-interval=SECS\n"
 			 "                         time between status packets sent to server (default: %d)\n"), (standby_message_timeout / 1000));
 	printf(_("  -S, --slot=SLOTNAME    name of the logical replication slot\n"));
+	printf(_("  -t, --target-dsn=DSN   DSN to the target database to push changes into\n"));
 	printf(_("  -v, --verbose          output verbose messages\n"));
 	printf(_("  -V, --version          output version information, then exit\n"));
 	printf(_("  -?, --help             show this help, then exit\n"));
@@ -166,29 +163,90 @@ disconnect_and_exit(int code)
 }
 
 static bool
-OutputFsync(int64 now)
+prepare_logserver(PGconn *log_conn)
 {
-	output_last_fsync = now;
+	PGresult *res;
 
-	output_fsync_lsn = output_written_lsn;
-
-	if (fsync_interval <= 0)
-		return true;
-
-	if (!output_needs_fsync)
-		return true;
-
-	output_needs_fsync = false;
-
-	/* can only fsync if it's a regular file */
-	if (!output_isfile)
-		return true;
-
-	if (fsync(outfd) != 0)
+	res = PQexec(log_conn, "CREATE TABLE IF NOT EXISTS trivialreplay_log (ts timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP, logpos int8, sql text)");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
-		fprintf(stderr,
-				_("%s: could not fsync log file \"%s\": %s\n"),
-				progname, outfile, strerror(errno));
+		fprintf(stderr, "Failed to create log table\n");
+		PQclear(res);
+		return false;
+	}
+	PQclear(res);
+
+	res = PQprepare(log_conn, "log_ins",
+					"INSERT INTO trivialreplay_log (logpos, sql) VALUES ($1, $2)",
+					2,
+					(int[]){20, 25});
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		fprintf(stderr, "Failed to prepare logging query\n");
+		PQclear(res);
+		return false;
+	}
+	PQclear(res);
+
+	return true;
+}
+
+static bool
+log_write(PGconn *log_conn, XLogRecPtr lsn, char *sql)
+{
+	PGresult *res;
+
+	if (log_conn)
+	{
+		uint64_t lsn_out = htobe64(lsn);
+		res = PQexecPrepared(log_conn,
+							 "log_ins",
+							 2,
+							 (const char *[]){(char *)&lsn_out, sql},
+							 (int[]){sizeof(lsn_out), 0},
+							 (int[]){1, 0},
+							 0);
+		if (!res)
+			fprintf(stderr, "IS NULL\n");
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			fprintf(stderr, "Failed to write to log: %s\n", PQerrorMessage(log_conn));
+			PQclear(res);
+			return false;
+		}
+		PQclear(res);
+	}
+	return true;
+}
+
+static bool
+prepare_targetserver(PGconn *target_conn)
+{
+	PGresult   *res;
+
+	res = PQexec(target_conn, "CREATE TABLE IF NOT EXISTS _logicalreceive.status (commit_pos int8)");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		fprintf(stderr, "Failed to create status table\n");
+		PQclear(res);
+		return false;
+	}
+	PQclear(res);
+
+	res = PQexec(target_conn, "INSERT INTO _logicalreceive.status SELECT 0 WHERE NOT EXISTS (SELECT * FROM _logicalreceive.status)");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		fprintf(stderr, "Failed to populate status table\n");
+		PQclear(res);
+		return false;
+	}
+	PQclear(res);
+
+	res = PQprepare(target_conn, "upd", "UPDATE _logicalreceive.status SET commit_pos=$1", 1, (int[]){20});
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		fprintf(stderr, "Failed to prepare location update query\n");
+		PQclear(res);
 		return false;
 	}
 
@@ -206,6 +264,9 @@ StreamLogicalLog(void)
 	int64		last_status = -1;
 	int			i;
 	PQExpBuffer query;
+	PGconn	   *log_conn = NULL;
+	PGconn	   *target_conn = NULL;
+	bool		in_transaction = false;
 
 	output_written_lsn = InvalidXLogRecPtr;
 	output_fsync_lsn = InvalidXLogRecPtr;
@@ -220,6 +281,38 @@ StreamLogicalLog(void)
 	if (!conn)
 		/* Error message already written in GetConnection() */
 		return;
+
+	if (log_dsn)
+	{
+		log_conn = PQconnectdb(log_dsn);
+		if (!log_dsn || PQstatus(log_conn) != CONNECTION_OK)
+		{
+			fprintf(stderr, "Logserver connect failed: %s", PQerrorMessage(log_conn));
+			goto error;
+		}
+	}
+	if (log_dsn && !prepare_logserver(log_conn))
+		goto error;
+
+	target_conn = PQconnectdb(target_dsn);
+	if (!target_conn || PQstatus(target_conn) != CONNECTION_OK)
+	{
+		fprintf(stderr, "Target connect failed: %s", PQerrorMessage(target_conn));
+		goto error;
+	}
+	if (!prepare_targetserver(target_conn))
+		goto error;
+
+	res = PQexec(target_conn, "SELECT commit_pos FROM _logicalreceive.status");
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		fprintf(stderr, "Failed to get start position\n");
+		PQclear(res);
+		goto error;
+	}
+	startpos = atoll(PQgetvalue(res, 0, 0));
+	PQclear(res);
+
 
 	/*
 	 * Start the replication
@@ -290,14 +383,6 @@ StreamLogicalLog(void)
 		 */
 		now = feGetCurrentTimestamp();
 
-		if (outfd != -1 &&
-			feTimestampDifferenceExceeds(output_last_fsync, now,
-										 fsync_interval))
-		{
-			if (!OutputFsync(now))
-				goto error;
-		}
-
 		if (standby_message_timeout > 0 &&
 			feTimestampDifferenceExceeds(last_status, now,
 										 standby_message_timeout))
@@ -307,43 +392,6 @@ StreamLogicalLog(void)
 				goto error;
 
 			last_status = now;
-		}
-
-		/* got SIGHUP, close output file */
-		if (outfd != -1 && output_reopen && strcmp(outfile, "-") != 0)
-		{
-			now = feGetCurrentTimestamp();
-			if (!OutputFsync(now))
-				goto error;
-			close(outfd);
-			outfd = -1;
-		}
-		output_reopen = false;
-
-		/* open the output file, if not open yet */
-		if (outfd == -1)
-		{
-			struct stat statbuf;
-
-			if (strcmp(outfile, "-") == 0)
-				outfd = fileno(stdout);
-			else
-				outfd = open(outfile, O_CREAT | O_APPEND | O_WRONLY | PG_BINARY,
-							 S_IRUSR | S_IWUSR);
-			if (outfd == -1)
-			{
-				fprintf(stderr,
-						_("%s: could not open log file \"%s\": %s\n"),
-						progname, outfile, strerror(errno));
-				goto error;
-			}
-
-			if (fstat(outfd, &statbuf) != 0)
-				fprintf(stderr,
-						_("%s: could not stat file \"%s\": %s\n"),
-						progname, outfile, strerror(errno));
-
-			output_isfile = S_ISREG(statbuf.st_mode) && !isatty(outfd);
 		}
 
 		r = PQgetCopyData(conn, &copybuf, 1);
@@ -366,11 +414,6 @@ StreamLogicalLog(void)
 			/* Compute when we need to wakeup to send a keepalive message. */
 			if (standby_message_timeout)
 				message_target = last_status + (standby_message_timeout - 1) *
-					((int64) 1000);
-
-			/* Compute when we need to wakeup to fsync the output file. */
-			if (fsync_interval > 0 && output_needs_fsync)
-				fsync_target = output_last_fsync + (fsync_interval - 1) *
 					((int64) 1000);
 
 			/* Now compute when to wakeup. */
@@ -468,10 +511,6 @@ StreamLogicalLog(void)
 			/* If the server requested an immediate reply, send one. */
 			if (replyRequested)
 			{
-				/* fsync data, so we send a recent flush pointer */
-				if (!OutputFsync(now))
-					goto error;
-
 				now = feGetCurrentTimestamp();
 				if (!sendFeedback(conn, now, true, false))
 					goto error;
@@ -511,40 +550,86 @@ StreamLogicalLog(void)
 		}
 
 		bytes_left = r - hdr_len;
-		bytes_written = 0;
 
-		/* signal that a fsync is needed */
-		output_needs_fsync = true;
-
-		while (bytes_left)
+		/*
+		 * Copy promises that the returned string is always null terminated,
+		 * and it will be the last thing here, so we can print it.
+		 */
+		if (strcmp(copybuf+hdr_len, "BEGIN;") == 0)
 		{
-			int			ret;
-
-			ret = write(outfd,
-						copybuf + hdr_len + bytes_written,
-						bytes_left);
-
-			if (ret < 0)
+			if (in_transaction)
 			{
-				fprintf(stderr,
-				  _("%s: could not write %u bytes to log file \"%s\": %s\n"),
-						progname, bytes_left, outfile,
-						strerror(errno));
+				fprintf(stderr, "Received BEGIN when already in transaction.\n");
 				goto error;
 			}
+			else
+			{
+				/* Open a transaction. */
+				res = PQexec(target_conn, "BEGIN");
+				if (PQresultStatus(res) != PGRES_COMMAND_OK)
+				{
+					fprintf(stderr, "Failed to open transaction: %s\n", PQerrorMessage(target_conn));
+					PQclear(res);
+					goto error;
+				}
+				in_transaction = true;
 
-			/* Write was successful, advance our position */
-			bytes_written += ret;
-			bytes_left -= ret;
+				if (!log_write(log_conn, output_written_lsn, "BEGIN"))
+					goto error;
+			}
 		}
-
-		if (write(outfd, "\n", 1) != 1)
+		else if (strcmp(copybuf+hdr_len, "COMMIT;") == 0)
 		{
-			fprintf(stderr,
-				  _("%s: could not write %u bytes to log file \"%s\": %s\n"),
-					progname, 1, outfile,
-					strerror(errno));
-			goto error;
+			if (!in_transaction)
+			{
+				fprintf(stderr, "Received COMMIT when not in a transaction.\n");
+				goto error;
+			}
+			else
+			{
+				uint64_t lsn_out = htobe64(output_written_lsn);
+
+				/* Commit the transaction, including updating where we are */
+				res = PQexecPrepared(target_conn, "upd", 1, (const char *[]){(char *)&lsn_out},
+									 (int[]){sizeof(lsn_out)}, (int[]){1}, 0);
+				if (PQresultStatus(res) != PGRES_COMMAND_OK || atoi(PQcmdTuples(res)) != 1)
+				{
+					fprintf(stderr, "Failed to update status counter: %s\n", PQerrorMessage(target_conn));
+					PQclear(res);
+					goto error;
+				}
+
+				/* Now that we're here, commit it */
+				res = PQexec(target_conn, "COMMIT");
+				if (PQresultStatus(res) != PGRES_COMMAND_OK)
+				{
+					fprintf(stderr, "Failed to commit transaction: %s\n", PQerrorMessage(target_conn));
+					PQclear(res);
+				}
+				in_transaction = false;
+
+				if (!log_write(log_conn, output_written_lsn, "COMMIT"))
+					goto error;
+
+				/* Finally tell the server that we're happy */
+				output_fsync_lsn = output_written_lsn;
+				sendFeedback(conn, now, true, false);
+			}
+		}
+		else
+		{
+			res = PQexec(target_conn, copybuf+hdr_len);
+			if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			{
+				fprintf(stderr, "Failed to replay: %s\n", PQerrorMessage(target_conn));
+				PQclear(res);
+				goto error;
+			}
+			PQclear(res);
+
+			if (!log_write(log_conn, output_written_lsn, copybuf+hdr_len))
+				goto error;
+
 		}
 	}
 
@@ -558,18 +643,6 @@ StreamLogicalLog(void)
 	}
 	PQclear(res);
 
-	if (outfd != -1 && strcmp(outfile, "-") != 0)
-	{
-		int64		t = feGetCurrentTimestamp();
-
-		/* no need to jump to error on failure here, we're finishing anyway */
-		OutputFsync(t);
-
-		if (close(outfd) != 0)
-			fprintf(stderr, _("%s: could not close file \"%s\": %s\n"),
-					progname, outfile, strerror(errno));
-	}
-	outfd = -1;
 error:
 	if (copybuf != NULL)
 	{
@@ -579,6 +652,16 @@ error:
 	destroyPQExpBuffer(query);
 	PQfinish(conn);
 	conn = NULL;
+	if (target_conn)
+	{
+		PQfinish(target_conn);
+		target_conn = NULL;
+	}
+	if (log_conn)
+	{
+		PQfinish(log_conn);
+		log_conn = NULL;
+	}
 }
 
 /*
@@ -596,16 +679,7 @@ sigint_handler(int signum)
 	time_to_abort = true;
 }
 
-/*
- * Trigger the output file to be reopened.
- */
-static void
-sighup_handler(int signum)
-{
-	output_reopen = true;
-}
 #endif
-
 
 int
 main(int argc, char **argv)
@@ -631,6 +705,7 @@ main(int argc, char **argv)
 		{"plugin", required_argument, NULL, 'P'},
 		{"status-interval", required_argument, NULL, 's'},
 		{"slot", required_argument, NULL, 'S'},
+		{"target-dsn", required_argument, NULL, 't'},
 /* action */
 		{"create-slot", no_argument, NULL, 1},
 		{"start", no_argument, NULL, 2},
@@ -662,24 +737,12 @@ main(int argc, char **argv)
 		}
 	}
 
-	while ((c = getopt_long(argc, argv, "f:F:nvd:h:p:U:wWI:o:P:s:S:",
+	while ((c = getopt_long(argc, argv, "f:F:nvd:h:p:U:wWI:o:P:s:S:l:t:",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
 		{
 /* general options */
-			case 'f':
-				outfile = pg_strdup(optarg);
-				break;
-			case 'F':
-				fsync_interval = atoi(optarg) * 1000;
-				if (fsync_interval < 0)
-				{
-					fprintf(stderr, _("%s: invalid fsync interval \"%s\"\n"),
-							progname, optarg);
-					exit(1);
-				}
-				break;
 			case 'n':
 				noloop = 1;
 				break;
@@ -757,6 +820,12 @@ main(int argc, char **argv)
 			case 'S':
 				replication_slot = pg_strdup(optarg);
 				break;
+			case 'l':
+				log_dsn = pg_strdup(optarg);
+				break;
+			case 't':
+				target_dsn = pg_strdup(optarg);
+				break;
 /* action */
 			case 1:
 				do_create_slot = true;
@@ -806,9 +875,9 @@ main(int argc, char **argv)
 		exit(1);
 	}
 
-	if (do_start_slot && outfile == NULL)
+	if (target_dsn == NULL)
 	{
-		fprintf(stderr, _("%s: no target file specified\n"), progname);
+		fprintf(stderr, _("%s: no target DSN specified\n"), progname);
 		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
 				progname);
 		exit(1);
@@ -848,7 +917,6 @@ main(int argc, char **argv)
 
 #ifndef WIN32
 	pqsignal(SIGINT, sigint_handler);
-	pqsignal(SIGHUP, sighup_handler);
 #endif
 
 	/*
