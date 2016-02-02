@@ -50,7 +50,7 @@ PGconn	   *conn = NULL;
  * call exit(1) directly.
  */
 PGconn *
-GetConnection(void)
+GetConnection(bool replication)
 {
 	PGconn	   *tmpconn;
 	int			argcount = 7;	/* dbname, replication, fallback_app_name,
@@ -107,7 +107,10 @@ GetConnection(void)
 	values[i] = dbname == NULL ? "replication" : dbname;
 	i++;
 	keywords[i] = "replication";
-	values[i] = dbname == NULL ? "true" : "database";
+	if (replication)
+		values[i] = dbname == NULL ? "true" : "database";
+	else
+		values[i] = "false";
 	i++;
 	keywords[i] = "fallback_application_name";
 	values[i] = progname;

@@ -72,6 +72,11 @@ similar to `pg_recvlogical`, and also:
   DSN for target database. This is the database that all the statements will be
   replayed.
 
+> --check
+
+  Run a check on the origin database (makes a regular connection instead of a
+  replication one) and warns about any tables that cannot be properly replicated.
+
 As with normal logical replication, first create a slot, and then use it. It
 is **very** important to always set `include_transaction=on` as an option!
 

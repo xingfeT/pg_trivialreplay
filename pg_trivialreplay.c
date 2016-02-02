@@ -42,6 +42,7 @@ static bool do_create_slot = false;
 static bool slot_exists_ok = false;
 static bool do_start_slot = false;
 static bool do_drop_slot = false;
+static bool do_check = false;
 static char *log_dsn = NULL;
 static char *target_dsn = NULL;
 
@@ -70,6 +71,7 @@ usage(void)
 	printf(_("      --create-slot      create a new replication slot (for the slot's name see --slot)\n"));
 	printf(_("      --drop-slot        drop the replication slot (for the slot's name see --slot)\n"));
 	printf(_("      --start            start streaming in a replication slot (for the slot's name see --slot)\n"));
+	printf(_("      --check            check replica identity of origin tables\n")),
 	printf(_("\nOptions:\n"));
 	printf(_("      --if-not-exists    do not error if slot already exists when creating a slot\n"));
 	printf(_("  -I, --startpos=LSN     where in an existing slot should the streaming start\n"));
@@ -277,7 +279,7 @@ StreamLogicalLog(void)
 	 * Connect in replication mode to the server
 	 */
 	if (!conn)
-		conn = GetConnection();
+		conn = GetConnection(true);
 	if (!conn)
 		/* Error message already written in GetConnection() */
 		return;
@@ -664,6 +666,41 @@ error:
 	}
 }
 
+static void
+check_origin(void)
+{
+	PGresult *res;
+	int i;
+
+	conn = GetConnection(false);
+	if (!conn)
+		/* Error message already printed */
+		return;
+
+	res = PQexec(conn, "SELECT quote_ident(nspname), quote_ident(relname) FROM pg_class INNER JOIN pg_namespace ON pg_namespace.oid=relnamespace WHERE relkind='r' AND NOT (nspname LIKE 'pg_%' OR nspname='information_schema') AND (relreplident='n' OR (relreplident='d' AND NOT relhaspkey))");
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		fprintf(stderr, _("%s: failed to query for tables: %s\n"),
+				progname, PQerrorMessage(conn));
+		return;
+	}
+
+	if (PQntuples(res) == 0)
+	{
+		printf("All tables can be replicated.\n");
+		PQclear(res);
+		return;
+	}
+
+	for (i = 0; i < PQntuples(res); i++)
+	{
+		printf("Table %s.%s cannot replicate UPDATE/DELETE due to lack of REPLICA IDENTITY\n",
+			   PQgetvalue(res, i, 0),
+			   PQgetvalue(res, i, 1));
+	}
+	PQclear(res);
+}
+
 /*
  * Unfortunately we can't do sensible signal handling on windows...
  */
@@ -711,6 +748,7 @@ main(int argc, char **argv)
 		{"start", no_argument, NULL, 2},
 		{"drop-slot", no_argument, NULL, 3},
 		{"if-not-exists", no_argument, NULL, 4},
+		{"check", no_argument, NULL, 5},
 		{NULL, 0, NULL, 0}
 	};
 	int			c;
@@ -839,6 +877,9 @@ main(int argc, char **argv)
 			case 4:
 				slot_exists_ok = true;
 				break;
+			case 5:
+				do_check = true;
+				break;
 
 			default:
 
@@ -867,7 +908,7 @@ main(int argc, char **argv)
 	/*
 	 * Required arguments
 	 */
-	if (replication_slot == NULL)
+	if (replication_slot == NULL && !do_check)
 	{
 		fprintf(stderr, _("%s: no slot specified\n"), progname);
 		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
@@ -891,9 +932,17 @@ main(int argc, char **argv)
 		exit(1);
 	}
 
-	if (!do_drop_slot && !do_create_slot && !do_start_slot)
+	if (!do_drop_slot && !do_create_slot && !do_start_slot && !do_check)
 	{
 		fprintf(stderr, _("%s: at least one action needs to be specified\n"), progname);
+		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
+				progname);
+		exit(1);
+	}
+
+	if (do_check && (do_create_slot || do_start_slot || do_drop_slot))
+	{
+		fprintf(stderr, _("%s: cannot use --check together with any other actions\n"), progname);
 		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
 				progname);
 		exit(1);
@@ -919,12 +968,19 @@ main(int argc, char **argv)
 	pqsignal(SIGINT, sigint_handler);
 #endif
 
+	if (do_check)
+	{
+		/* do_check doesn't use the standard connection, so call it separtely */
+		check_origin();
+		disconnect_and_exit(0);
+	}
+
 	/*
 	 * Obtain a connection to server. This is not really necessary but it
 	 * helps to get more precise error messages about authentification,
 	 * required GUC parameters and such.
 	 */
-	conn = GetConnection();
+	conn = GetConnection(true);
 	if (!conn)
 		/* Error message already written in GetConnection() */
 		exit(1);
