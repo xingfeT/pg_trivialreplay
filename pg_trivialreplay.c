@@ -875,7 +875,7 @@ main(int argc, char **argv)
 		exit(1);
 	}
 
-	if (target_dsn == NULL)
+	if (target_dsn == NULL && do_start_slot)
 	{
 		fprintf(stderr, _("%s: no target DSN specified\n"), progname);
 		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
