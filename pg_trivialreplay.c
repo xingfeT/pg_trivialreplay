@@ -172,7 +172,7 @@ prepare_logserver(PGconn *log_conn)
 	res = PQexec(log_conn, "CREATE TABLE IF NOT EXISTS trivialreplay_log (ts timestamptz NOT NULL DEFAULT CURRENT_TIMESTAMP, logpos int8, sql text)");
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
-		fprintf(stderr, "Failed to create log table\n");
+		fprintf(stderr, _("%s: could not create log table\n"), progname);
 		PQclear(res);
 		return false;
 	}
@@ -184,7 +184,7 @@ prepare_logserver(PGconn *log_conn)
 					(int[]){20, 25});
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
-		fprintf(stderr, "Failed to prepare logging query\n");
+		fprintf(stderr, _("%s: could not prepare logging query\n"), progname);
 		PQclear(res);
 		return false;
 	}
@@ -208,11 +208,9 @@ log_write(PGconn *log_conn, XLogRecPtr lsn, char *sql)
 							 (int[]){sizeof(lsn_out), 0},
 							 (int[]){1, 0},
 							 0);
-		if (!res)
-			fprintf(stderr, "IS NULL\n");
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 		{
-			fprintf(stderr, "Failed to write to log: %s\n", PQerrorMessage(log_conn));
+			fprintf(stderr, _("%s: could not write to log: %s\n"), progname,  PQerrorMessage(log_conn));
 			PQclear(res);
 			return false;
 		}
@@ -229,7 +227,7 @@ prepare_targetserver(PGconn *target_conn)
 	res = PQexec(target_conn, "CREATE TABLE IF NOT EXISTS _logicalreceive.status (commit_pos int8)");
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
-		fprintf(stderr, "Failed to create status table\n");
+		fprintf(stderr, _("%s: could not create status table\n"), progname);
 		PQclear(res);
 		return false;
 	}
@@ -238,7 +236,7 @@ prepare_targetserver(PGconn *target_conn)
 	res = PQexec(target_conn, "INSERT INTO _logicalreceive.status SELECT 0 WHERE NOT EXISTS (SELECT * FROM _logicalreceive.status)");
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
-		fprintf(stderr, "Failed to populate status table\n");
+		fprintf(stderr, _("%s: could not populate status table\n"), progname);
 		PQclear(res);
 		return false;
 	}
@@ -247,7 +245,7 @@ prepare_targetserver(PGconn *target_conn)
 	res = PQprepare(target_conn, "upd", "UPDATE _logicalreceive.status SET commit_pos=$1", 1, (int[]){20});
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
 	{
-		fprintf(stderr, "Failed to prepare location update query\n");
+		fprintf(stderr, _("%s: could not prepare location update query\n"), progname);
 		PQclear(res);
 		return false;
 	}
@@ -289,7 +287,7 @@ StreamLogicalLog(void)
 		log_conn = PQconnectdb(log_dsn);
 		if (!log_dsn || PQstatus(log_conn) != CONNECTION_OK)
 		{
-			fprintf(stderr, "Logserver connect failed: %s", PQerrorMessage(log_conn));
+			fprintf(stderr, _("%s: could not connect to log server: %s"), progname, PQerrorMessage(log_conn));
 			goto error;
 		}
 	}
@@ -299,7 +297,7 @@ StreamLogicalLog(void)
 	target_conn = PQconnectdb(target_dsn);
 	if (!target_conn || PQstatus(target_conn) != CONNECTION_OK)
 	{
-		fprintf(stderr, "Target connect failed: %s", PQerrorMessage(target_conn));
+		fprintf(stderr, _("%s: could not connect to target server: %s"), progname, PQerrorMessage(target_conn));
 		goto error;
 	}
 	if (!prepare_targetserver(target_conn))
@@ -308,7 +306,7 @@ StreamLogicalLog(void)
 	res = PQexec(target_conn, "SELECT commit_pos FROM _logicalreceive.status");
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
-		fprintf(stderr, "Failed to get start position\n");
+		fprintf(stderr, _("%s: could not get start position\n"), progname);
 		PQclear(res);
 		goto error;
 	}
@@ -561,7 +559,7 @@ StreamLogicalLog(void)
 		{
 			if (in_transaction)
 			{
-				fprintf(stderr, "Received BEGIN when already in transaction.\n");
+				fprintf(stderr, _("%s: received BEGIN when already in transaction.\n"), progname);
 				goto error;
 			}
 			else
@@ -570,7 +568,7 @@ StreamLogicalLog(void)
 				res = PQexec(target_conn, "BEGIN");
 				if (PQresultStatus(res) != PGRES_COMMAND_OK)
 				{
-					fprintf(stderr, "Failed to open transaction: %s\n", PQerrorMessage(target_conn));
+					fprintf(stderr, _("%s: could not open transaction on target: %s\n"), progname, PQerrorMessage(target_conn));
 					PQclear(res);
 					goto error;
 				}
@@ -584,7 +582,7 @@ StreamLogicalLog(void)
 		{
 			if (!in_transaction)
 			{
-				fprintf(stderr, "Received COMMIT when not in a transaction.\n");
+				fprintf(stderr, _("%s: received COMMIT when not in a transaction.\n"), progname);
 				goto error;
 			}
 			else
@@ -596,7 +594,7 @@ StreamLogicalLog(void)
 									 (int[]){sizeof(lsn_out)}, (int[]){1}, 0);
 				if (PQresultStatus(res) != PGRES_COMMAND_OK || atoi(PQcmdTuples(res)) != 1)
 				{
-					fprintf(stderr, "Failed to update status counter: %s\n", PQerrorMessage(target_conn));
+					fprintf(stderr, _("%s: could not update status counter: %s\n"), progname, PQerrorMessage(target_conn));
 					PQclear(res);
 					goto error;
 				}
@@ -605,7 +603,7 @@ StreamLogicalLog(void)
 				res = PQexec(target_conn, "COMMIT");
 				if (PQresultStatus(res) != PGRES_COMMAND_OK)
 				{
-					fprintf(stderr, "Failed to commit transaction: %s\n", PQerrorMessage(target_conn));
+					fprintf(stderr, _("%s: could not commit transaction: %s\n"), progname, PQerrorMessage(target_conn));
 					PQclear(res);
 				}
 				in_transaction = false;
@@ -623,7 +621,7 @@ StreamLogicalLog(void)
 			res = PQexec(target_conn, copybuf+hdr_len);
 			if (PQresultStatus(res) != PGRES_COMMAND_OK)
 			{
-				fprintf(stderr, "Failed to replay: %s\n", PQerrorMessage(target_conn));
+				fprintf(stderr, _("%s: could not replay: %s\n"), progname, PQerrorMessage(target_conn));
 				PQclear(res);
 				goto error;
 			}
@@ -680,7 +678,7 @@ check_origin(void)
 	res = PQexec(conn, "SELECT quote_ident(nspname), quote_ident(relname) FROM pg_class INNER JOIN pg_namespace ON pg_namespace.oid=relnamespace WHERE relkind='r' AND NOT (nspname LIKE 'pg_%' OR nspname='information_schema') AND (relreplident='n' OR (relreplident='d' AND NOT relhaspkey))");
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
-		fprintf(stderr, _("%s: failed to query for tables: %s\n"),
+		fprintf(stderr, _("%s: could not query for tables: %s\n"),
 				progname, PQerrorMessage(conn));
 		return;
 	}
