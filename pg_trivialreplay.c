@@ -624,7 +624,8 @@ StreamLogicalLog(void)
 
 				/* Finally tell the server that we're happy */
 				output_fsync_lsn = output_written_lsn;
-				sendFeedback(conn, now, true, false);
+				if (!sendFeedback(conn, now, true, false))
+					goto error;
 			}
 		}
 		else
