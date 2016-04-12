@@ -300,6 +300,17 @@ StreamLogicalLog(void)
 		fprintf(stderr, _("%s: could not connect to target server: %s"), progname, PQerrorMessage(target_conn));
 		goto error;
 	}
+
+	/* Disable triggers on the receiving end */
+	res = PQexec(target_conn, "SET session_replication_role='replica'");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		fprintf(stderr, _("%s: could not set session replication role"), progname);
+		PQclear(res);
+		goto error;
+	}
+
+	/* Prepare statements and metadata tables */
 	if (!prepare_targetserver(target_conn))
 		goto error;
 
