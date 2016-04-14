@@ -77,8 +77,7 @@ similar to `pg_recvlogical`, and also:
   Run a check on the origin database (makes a regular connection instead of a
   replication one) and warns about any tables that cannot be properly replicated.
 
-As with normal logical replication, first create a slot, and then use it. It
-is **very** important to always set `include_transaction=on` as an option!
+As with normal logical replication, first create a slot, and then use it.!
 
 #### Example
 
@@ -89,6 +88,5 @@ $ pg_trivialreplay --create \
 $ pg_trivialreplay --start \
   -l "port=5432 dbname=postgres" \
   -t "port=5432 dbname=receiver" \
-  -d postgres -S trivialslot -o include_transaction=on\
-  -v
+  -d postgres -S trivialslot -v
 ```

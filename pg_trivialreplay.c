@@ -785,6 +785,17 @@ main(int argc, char **argv)
 		}
 	}
 
+	/*
+	 * Assign default value to options, which will be appended to.
+	 *
+	 * The include_transaction=on option is absolutely required for
+	 * the receiver to work properly, so always add it.
+	 */
+	noptions = 1;
+	options = pg_realloc(options, sizeof(char *) * noptions * 2);
+	options[0] = pg_strdup("include_transaction");
+	options[1] = pg_strdup("on");
+
 	while ((c = getopt_long(argc, argv, "f:F:nvd:h:p:U:wWI:o:P:s:S:l:t:",
 							long_options, &option_index)) != -1)
 	{
