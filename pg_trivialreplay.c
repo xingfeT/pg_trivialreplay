@@ -43,6 +43,7 @@ static bool slot_exists_ok = false;
 static bool do_start_slot = false;
 static bool do_drop_slot = false;
 static bool do_check = false;
+static bool verify_result_rowcount = true;
 static char *log_dsn = NULL;
 static char *target_dsn = NULL;
 
@@ -77,6 +78,7 @@ usage(void)
 	printf(_("  -I, --startpos=LSN     where in an existing slot should the streaming start\n"));
 	printf(_("  -l, --logserver=DSN    DSN to database to connect and write logs to\n"));
 	printf(_("  -n, --no-loop          do not loop on connection lost\n"));
+	printf(_("      --no-verify-count  do not verify rowcounts on UPDATE/INSERT/DElETE\n"));
 	printf(_("  -o, --option=NAME[=VALUE]\n"
 			 "                         pass option NAME with optional value VALUE to the\n"
 			 "                         output plugin\n"));
@@ -630,12 +632,24 @@ StreamLogicalLog(void)
 		}
 		else
 		{
+			/* Run the actual replicated statement */
 			res = PQexec(target_conn, copybuf+hdr_len);
 			if (PQresultStatus(res) != PGRES_COMMAND_OK)
 			{
 				fprintf(stderr, _("%s: could not replay: %s\n"), progname, PQerrorMessage(target_conn));
 				PQclear(res);
 				goto error;
+			}
+			if (verify_result_rowcount)
+			{
+				/* Verify that we always get one row */
+				if (strcmp(PQcmdTuples(res), "1") != 0)
+				{
+					fprintf(stderr, _("%s: replay of '%s' processed %s rows, not 1!\n"),
+							progname,
+							copybuf+hdr_len,
+							PQcmdTuples(res));
+				}
 			}
 			PQclear(res);
 
@@ -753,6 +767,7 @@ main(int argc, char **argv)
 		{"status-interval", required_argument, NULL, 's'},
 		{"slot", required_argument, NULL, 'S'},
 		{"target-dsn", required_argument, NULL, 't'},
+		{"no-verify-count", no_argument, NULL, 6},
 /* action */
 		{"create-slot", no_argument, NULL, 1},
 		{"start", no_argument, NULL, 2},
@@ -900,6 +915,9 @@ main(int argc, char **argv)
 				break;
 			case 5:
 				do_check = true;
+				break;
+			case 6:
+				verify_result_rowcount = false;
 				break;
 
 			default:
