@@ -649,6 +649,8 @@ StreamLogicalLog(void)
 							progname,
 							copybuf+hdr_len,
 							PQcmdTuples(res));
+					PQclear(res);
+					goto error;
 				}
 			}
 			PQclear(res);
