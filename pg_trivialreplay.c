@@ -180,6 +180,15 @@ prepare_logserver(PGconn *log_conn)
 	}
 	PQclear(res);
 
+	res = PQexec(log_conn, "SET synchronous_commit='off'");
+	if (PQresultStatus(res) != PGRES_COMMAND_OK)
+	{
+		fprintf(stderr, _("%s: could not disable synchronous_commit on log server\n"), progname);
+		PQclear(res);
+		return false;
+	}
+	PQclear(res);
+
 	res = PQprepare(log_conn, "log_ins",
 					"INSERT INTO trivialreplay_log (logpos, sql) VALUES ($1, $2)",
 					2,
