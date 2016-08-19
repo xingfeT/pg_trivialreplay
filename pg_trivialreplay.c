@@ -212,20 +212,35 @@ log_write(PGconn *log_conn, XLogRecPtr lsn, char *sql)
 	if (log_conn)
 	{
 		uint64_t lsn_out = htobe64(lsn);
-		res = PQexecPrepared(log_conn,
-							 "log_ins",
-							 2,
-							 (const char *[]){(char *)&lsn_out, sql},
-							 (int[]){sizeof(lsn_out), 0},
-							 (int[]){1, 0},
-							 0);
-		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+
+		/*
+		 * Consume the input of a previous log command. Returns NULL
+		 */
+		while (res = PQgetResult(log_conn))
 		{
-			fprintf(stderr, _("%s: could not write to log: %s\n"), progname,  PQerrorMessage(log_conn));
+			if (PQresultStatus(res) != PGRES_COMMAND_OK)
+			{
+				fprintf(stderr, _("%s: could not write to log: %s\n"), progname,  PQerrorMessage(log_conn));
+				PQclear(res);
+				return false;
+			}
 			PQclear(res);
+		}
+
+		/*
+		 * Send the log data asynchronously, to avoid blocking
+		 */
+		if (PQsendQueryPrepared(log_conn,
+								"log_ins",
+								2,
+								(const char *[]){(char *)&lsn_out, sql},
+								(int[]){sizeof(lsn_out), 0},
+								(int[]){1, 0},
+								0) != 1)
+		{
+			fprintf(stderr, _("%s: could not send logging query: %s\n"), progname, PQerrorMessage(log_conn));
 			return false;
 		}
-		PQclear(res);
 	}
 	return true;
 }
