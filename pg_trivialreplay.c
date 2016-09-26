@@ -256,6 +256,95 @@ prepare_targetserver(PGconn *target_conn)
 }
 
 /*
+ * Execute a target query asynchronously
+ */
+
+static const char *last_operation = NULL;
+static int last_operation_verify_rowcount = -1;
+static bool
+consume_async(PGconn *target_conn)
+{
+	PGresult *res;
+
+	while ((res = PQgetResult(target_conn)) != NULL)
+	{
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			fprintf(stderr, _("%s: could not %s: %s\n"), progname,
+							  last_operation ? last_operation : "(unknown operation)",
+							  PQerrorMessage(target_conn));
+			PQclear(res);
+			return false;
+		}
+		if (last_operation_verify_rowcount != -1)
+		{
+			if (atoi(PQcmdTuples(res)) != last_operation_verify_rowcount)
+			{
+				fprintf(stderr, _("%s: replay of '%s' processed %s rows, not %d!\n"),
+						progname,
+						last_operation ? last_operation : "(unknown)",
+						PQcmdTuples(res),
+						last_operation_verify_rowcount);
+				PQclear(res);
+				return false;
+			}
+		}
+		PQclear(res);
+	}
+	return true;
+}
+
+static bool
+async_exec(PGconn *target_conn, const char *query, const char *operation, int verify_row_count)
+{
+	/* First consume any previous async oepration */
+	if (!consume_async(target_conn))
+		return false;
+
+	/* Now execute the query */
+	last_operation = operation;
+	last_operation_verify_rowcount = verify_row_count;
+	if (PQsendQuery(target_conn, query) != 1)
+	{
+		fprintf(stderr, _("%s: could not send async query for %s: %s\n"), progname,
+						  last_operation ? last_operation : "(unknown operation)",
+						  PQerrorMessage(target_conn));
+		return false;
+	}
+
+	/* Results are checked on next entry into function */
+}
+
+static bool
+async_exec_prepared(PGconn *target_conn,
+					const char *stmtName,
+					int nParams,
+					const char * const *paramValues,
+					const int *paramLengths,
+					const int *paramFormats,
+					int resultFormat)
+{
+	/* First consume any previous async oepration */
+	if (!consume_async(target_conn))
+		return false;
+
+	last_operation = stmtName;
+	last_operation_verify_rowcount = -1;
+
+	if (PQsendQueryPrepared(target_conn, stmtName, nParams, paramValues, paramLengths, paramFormats, resultFormat) != 1)
+	{
+		fprintf(stderr, _("%s: could not send async prepared query for %s: %s\n"), progname,
+				last_operation ? last_operation : "(unknown operation)",
+				PQerrorMessage(target_conn));
+		return false;
+	}
+
+	return true;
+
+	/* Results are checked on next entry into function */
+}
+
+/*
  * Start the log streaming
  */
 static void
@@ -578,13 +667,9 @@ StreamLogicalLog(void)
 			else
 			{
 				/* Open a transaction. */
-				res = PQexec(target_conn, "BEGIN");
-				if (PQresultStatus(res) != PGRES_COMMAND_OK)
-				{
-					fprintf(stderr, _("%s: could not open transaction on target: %s\n"), progname, PQerrorMessage(target_conn));
-					PQclear(res);
+				if (!async_exec(target_conn, "BEGIN", "open transaction on target", -1))
 					goto error;
-				}
+
 				in_transaction = true;
 
 				if (!log_write(log_conn, output_written_lsn, "BEGIN"))
@@ -603,25 +688,20 @@ StreamLogicalLog(void)
 				uint64_t lsn_out = htobe64(output_written_lsn);
 
 				/* Commit the transaction, including updating where we are */
-				res = PQexecPrepared(target_conn, "upd", 1, (const char *[]){(char *)&lsn_out},
-									 (int[]){sizeof(lsn_out)}, (int[]){1}, 0);
-				if (PQresultStatus(res) != PGRES_COMMAND_OK || atoi(PQcmdTuples(res)) != 1)
-				{
-					fprintf(stderr, _("%s: could not update status counter: %s\n"), progname, PQerrorMessage(target_conn));
-					PQclear(res);
+				if (!async_exec_prepared(target_conn, "upd", 1, (const char *[]){(char *)&lsn_out},
+									 (int[]){sizeof(lsn_out)}, (int[]){1}, 0))
 					goto error;
-				}
 
 				/* Now that we're here, commit it */
-				res = PQexec(target_conn, "COMMIT");
-				if (PQresultStatus(res) != PGRES_COMMAND_OK)
-				{
-					fprintf(stderr, _("%s: could not commit transaction: %s\n"), progname, PQerrorMessage(target_conn));
-					PQclear(res);
-				}
+				if (!async_exec(target_conn, "COMMIT", "commit transaction", -1))
+					goto error;
 				in_transaction = false;
 
 				if (!log_write(log_conn, output_written_lsn, "COMMIT"))
+					goto error;
+
+				/* Wait for the commit to be acknowledged before we send it upstream */
+				if (!consume_async(target_conn))
 					goto error;
 
 				/* Finally tell the server that we're happy */
@@ -633,27 +713,8 @@ StreamLogicalLog(void)
 		else
 		{
 			/* Run the actual replicated statement */
-			res = PQexec(target_conn, copybuf+hdr_len);
-			if (PQresultStatus(res) != PGRES_COMMAND_OK)
-			{
-				fprintf(stderr, _("%s: could not replay: %s\n"), progname, PQerrorMessage(target_conn));
-				PQclear(res);
+			if (!async_exec(target_conn, copybuf+hdr_len, "replay statement", verify_result_rowcount ? 1 : -1))
 				goto error;
-			}
-			if (verify_result_rowcount)
-			{
-				/* Verify that we always get one row */
-				if (strcmp(PQcmdTuples(res), "1") != 0)
-				{
-					fprintf(stderr, _("%s: replay of '%s' processed %s rows, not 1!\n"),
-							progname,
-							copybuf+hdr_len,
-							PQcmdTuples(res));
-					PQclear(res);
-					goto error;
-				}
-			}
-			PQclear(res);
 
 			if (!log_write(log_conn, output_written_lsn, copybuf+hdr_len))
 				goto error;
