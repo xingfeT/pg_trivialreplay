@@ -79,6 +79,17 @@ similar to `pg_recvlogical`, and also:
 
 As with normal logical replication, first create a slot, and then use it.!
 
+### Batch size
+
+Transactions can be batched using the `-b` parameter. Using this, multiple
+transactions on the origin will turn into a single transaction on the
+receiving end, for increased performance.
+
+When transaction batching is enabled, there is no timeout or other way
+to flush the contents. Instead, the operator needs to restart
+`pg_trivialreplay` with a batch size of 1 to make sure that any pending
+changes are replicated.
+
 #### Example
 
 ```

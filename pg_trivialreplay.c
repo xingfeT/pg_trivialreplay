@@ -46,6 +46,7 @@ static bool do_check = false;
 static bool verify_result_rowcount = true;
 static char *log_dsn = NULL;
 static char *target_dsn = NULL;
+static int batch_size = 1;
 
 /* filled pairwise with option, value. value may be NULL */
 static char **options;
@@ -74,6 +75,7 @@ usage(void)
 	printf(_("      --start            start streaming in a replication slot (for the slot's name see --slot)\n"));
 	printf(_("      --check            check replica identity of origin tables\n")),
 	printf(_("\nOptions:\n"));
+	printf(_("  -b, --batch-size       number of transactions in a batch\n"));
 	printf(_("      --if-not-exists    do not error if slot already exists when creating a slot\n"));
 	printf(_("  -I, --startpos=LSN     where in an existing slot should the streaming start\n"));
 	printf(_("  -l, --logserver=DSN    DSN to database to connect and write logs to\n"));
@@ -358,6 +360,7 @@ StreamLogicalLog(void)
 	PGconn	   *log_conn = NULL;
 	PGconn	   *target_conn = NULL;
 	bool		in_transaction = false;
+	int			current_batch = 0;
 
 	output_written_lsn = InvalidXLogRecPtr;
 	output_fsync_lsn = InvalidXLogRecPtr;
@@ -666,6 +669,16 @@ StreamLogicalLog(void)
 			}
 			else
 			{
+				/*
+				 * If we are in the middle of a batched transaction,
+				 * we may already have an open write transaction.
+				 */
+				if (current_batch > 0)
+				{
+					in_transaction = true;
+					continue;
+				}
+
 				/* Open a transaction. */
 				if (!async_exec(target_conn, "BEGIN", "open transaction on target", -1))
 					goto error;
@@ -686,6 +699,22 @@ StreamLogicalLog(void)
 			else
 			{
 				uint64_t lsn_out = htobe64(output_written_lsn);
+
+				/*
+				 * If we are batching more than one transaction, check
+				 * if it's time to flush yet. If it's not time to flush,
+				 * just keep running - specifically do *not* send a
+				 * status message to the master saying that we have
+				 * flushed yet.
+				 */
+				current_batch++;
+				if (current_batch < batch_size)
+				{
+					fprintf(stderr, "Skipping one commit\n");fflush(stderr);
+					in_transaction = false;
+					continue;
+				}
+				fprintf(stderr, "Performing commit\n");fflush(stderr);
 
 				/* Commit the transaction, including updating where we are */
 				if (!async_exec_prepared(target_conn, "upd", 1, (const char *[]){(char *)&lsn_out},
@@ -708,6 +737,9 @@ StreamLogicalLog(void)
 				output_fsync_lsn = output_written_lsn;
 				if (!sendFeedback(conn, now, true, false))
 					goto error;
+
+				/* Flag us as the beginning of a new batch */
+				current_batch = 0;
 			}
 		}
 		else
@@ -831,6 +863,7 @@ main(int argc, char **argv)
 		{"slot", required_argument, NULL, 'S'},
 		{"target-dsn", required_argument, NULL, 't'},
 		{"no-verify-count", no_argument, NULL, 6},
+		{"batch-size", required_argument, NULL, 'b'},
 /* action */
 		{"create-slot", no_argument, NULL, 1},
 		{"start", no_argument, NULL, 2},
@@ -874,7 +907,7 @@ main(int argc, char **argv)
 	options[0] = pg_strdup("include_transaction");
 	options[1] = pg_strdup("on");
 
-	while ((c = getopt_long(argc, argv, "f:F:nvd:h:p:U:wWI:o:P:s:S:l:t:",
+	while ((c = getopt_long(argc, argv, "b:f:F:nvd:h:p:U:wWI:o:P:s:S:l:t:",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
@@ -912,6 +945,16 @@ main(int argc, char **argv)
 				dbgetpassword = 1;
 				break;
 /* replication options */
+			case 'b':
+				batch_size = atoi(optarg);
+				if (batch_size < 1)
+				{
+					fprintf(stderr,
+							_("%s: batch_size has to be positive\n"),
+							progname);
+					exit(1);
+				}
+				break;
 			case 'I':
 				if (sscanf(optarg, "%X/%X", &hi, &lo) != 2)
 				{
