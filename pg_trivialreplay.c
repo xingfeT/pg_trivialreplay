@@ -710,11 +710,9 @@ StreamLogicalLog(void)
 				current_batch++;
 				if (current_batch < batch_size)
 				{
-					fprintf(stderr, "Skipping one commit\n");fflush(stderr);
 					in_transaction = false;
 					continue;
 				}
-				fprintf(stderr, "Performing commit\n");fflush(stderr);
 
 				/* Commit the transaction, including updating where we are */
 				if (!async_exec_prepared(target_conn, "upd", 1, (const char *[]){(char *)&lsn_out},
