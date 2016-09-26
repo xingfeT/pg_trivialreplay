@@ -713,7 +713,7 @@ StreamLogicalLog(void)
 		else
 		{
 			/* Run the actual replicated statement */
-			if (!async_exec(target_conn, copybuf+hdr_len, "replay statement", verify_result_rowcount ? 1 : -1))
+			if (!async_exec(target_conn, copybuf+hdr_len, copybuf+hdr_len, verify_result_rowcount ? 1 : -1))
 				goto error;
 
 			if (!log_write(log_conn, output_written_lsn, copybuf+hdr_len))
