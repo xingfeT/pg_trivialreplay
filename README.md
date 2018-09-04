@@ -1,6 +1,6 @@
 # pg_trivialreplay
 
-`pg_trivialreplay` is a trivial fork of `pg_recvlogical` from PostgreSQL 9.5
+`pg_trivialreplay` is a trivial fork of `pg_recvlogical` from PostgreSQL 9.6
 that instead of writing the data out to a file, will write it directly to
 a target PostgreSQL database. As such it forms a very trivial receiving end
 of a logical replication solution. It is intended to be very lightweight,
@@ -25,7 +25,7 @@ schema, it will error on apply and give up.
 
 ## Installing
 
-To build, `pg_config` from PostgreSQL 9.5 needs to be available in the PATH.
+To build, `pg_config` from PostgreSQL 9.6 needs to be available in the PATH.
 Once that is present, just running `make` should build the frontend. No
 installation is necessary as it's just a single binary, which can be copied.
 
@@ -34,7 +34,7 @@ server.
 
 ### decoder_raw
 
-To work, `decoder_raw` needs to be installed on the *upstream 9.5 server*.
+To work, `decoder_raw` needs to be installed on the *upstream 9.6 server*.
 `decoder_raw` is found in Michael Paquiers package `pg_plugins` at
 https://github.com/michaelpq/pg_plugins/. The rest of the package is not
 necessary, so only the `decoder_raw` subdirectory needs a `make install`.
