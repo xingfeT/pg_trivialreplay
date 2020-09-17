@@ -26,25 +26,54 @@ extern int	dbgetpassword;
 extern char *replication_slot;
 
 /* Connection kept global so we can disconnect easily */
-extern PGconn *conn;
+struct Connection{
+    PGconn *conn;
+    Connection(bool replication){
+        conn = GetConnection(bool replication);
+    }
+    /*
+ * Create a replication slot for the given connection. This function
+ * returns true in case of success as well as the start position
+ * obtained after the slot creation.
+ */
+    bool CreateReplicationSlot(PGconn *conn, const char *slot_name,
+                               const char *plugin, bool is_physical,
+                               bool slot_exists_ok);
 
-extern PGconn *GetConnection(bool replication);
+    /*
+ * Drop a replication slot for the given connection. This function
+ * returns true in case of success.
+ */
+    bool DropReplicationSlot(const char *slot_name);
+
+/*
+ * Run IDENTIFY_SYSTEM through a given connection and give back to caller
+ * some result information if requested:
+ * - System identifier
+ * - Current timeline ID
+ * - Start LSN position
+ * - Database name (NULL in servers prior to 9.4)
+ */
+    bool RunIdentifySystem(char **sysid,
+                           TimeLineID *starttli,
+                           XLogRecPtr *startpos,
+                           char **db_name);
+
+};
+
+
+extern PGconn * GetConnection(bool replication);
 
 /* Replication commands */
-extern bool CreateReplicationSlot(PGconn *conn, const char *slot_name,
-					  const char *plugin, bool is_physical,
-					  bool slot_exists_ok);
-extern bool DropReplicationSlot(PGconn *conn, const char *slot_name);
-extern bool RunIdentifySystem(PGconn *conn, char **sysid,
-				  TimeLineID *starttli,
-				  XLogRecPtr *startpos,
-				  char **db_name);
+
+
+
 extern int64 feGetCurrentTimestamp(void);
 extern void feTimestampDifference(int64 start_time, int64 stop_time,
-					  long *secs, int *microsecs);
+                                  long *secs, int *microsecs);
 
 extern bool feTimestampDifferenceExceeds(int64 start_time, int64 stop_time,
-							 int msec);
+                                         int msec);
 extern void fe_sendint64(int64 i, char *buf);
 extern int64 fe_recvint64(char *buf);
 
