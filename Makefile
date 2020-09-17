@@ -5,7 +5,7 @@ LDFLAGS=-Wall -L$(shell pg_config --pkglibdir) -L../inst/head/lib -lpq -L../inst
 OBJS=pg_trivialreplay.o streamutil.o receivelog.o
 
 pg_trivialreplay: ${OBJS}
-	${CC} ${OBJS} ${LDFLAGS} -o pg_trivialreplay
+	${CXX} ${OBJS} ${LDFLAGS} -o pg_trivialreplay
 
 clean:
 	rm -f ${OBJS}
